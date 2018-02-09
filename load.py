@@ -1,11 +1,18 @@
 import os
 import matlablike as pys
+import string
+import struct
+import re
 
 """
 Basic file loading functionality for Bruker files
 
 """
 
+"""
+EPR Specific file handling
+"""
+# {{{
 def loadEPRFits(fileName):# {{{
     """
     Load in the fitting data that the multi component NLSL fitting program returns.
@@ -332,4 +339,518 @@ def loadEPRt2TwoDim(path,name,extension='.DTA',runsToCut=False,firstFigure=[],sh
             pys.colorbar()
             pys.title('Run Selection')
     return data2d# }}}
+# }}}
+
+"""
+NMR Specific file handling
+"""
+
+
+b0 = r'$B_0$'
+
+#{{{ load the pulse sequence parameters
+def load_acqu(filename,whichdim='',return_s = None):
+    filename = dirformat(filename)
+    if det_type(filename)[0] == 'bruker':
+        if return_s is not None:
+            return bruker_load_acqu(filename,whichdim=whichdim,return_s = return_s)
+        else:
+            return bruker_load_acqu(filename,whichdim=whichdim)
+    elif det_type(filename)[0] == 'prospa':
+        if det_type(filename)[1] == 't1_sub':
+            filename = dirformat(filename)
+            return prospa_load_acqu(filename+'../')
+        else:
+            return prospa_load_acqu(filename)
+    else:
+        raise CustomError(det_type(filename),'is not yet supported')
+#}}}
+
+#{{{ Determine type of file Bruker or Prospa 1 or 2 D
+## You could turn this into an overall file parser.
+def det_type(filename):
+    filetype = None
+    # WinEPR
+    if os.path.exists(filename+'.spc'):
+        return ('winepr',True)
+    else:
+        filename = dirformat(filename)
+        files_in_dir = os.listdir(filename)
+        # Bruker 2D
+        if os.path.exists(filename+'ser'):
+            return ('bruker',True)
+        # Prospa generic 2D
+        elif os.path.exists(filename+'data.2d'):
+            return ('prospa',True)
+        # specific Prospa formats
+        elif any(map((lambda x:'Delay' in x),files_in_dir)):
+            return ('prospa','t1')
+        elif os.path.exists(filename+'acqu.par'):
+            return ('prospa',False)
+        elif os.path.exists(filename+'../acqu.par'):
+            return ('prospa','t1_sub')
+        # Bruker 1D
+        elif os.path.exists(filename+'acqus'):
+            return ('bruker',False)
+        else:
+            raise CustomError('WARNING! unidentified file type '+filename)
+#}}}
+
+def format_listofexps(args):
+    'aux function, just used to decode (filename,listofexpnos) vs. (listoffilenames) in an arbitrary way'
+    if type(args[0]) is str: # even if it's just a string, make it a list
+        args[0] = [args[0]]
+    if len(args) > 1 and ((not isscalar(args[1])) and len(args[1]) == 0): args.pop(1)
+    if len(args) > 1:
+        if len(args) > 2: raise CustomError('wrong number of args!')
+        if isscalar(args[1]): args[1] = [args[1]] # if the second argument is a single file number, make it into a list
+        if len(args[0]) > 1: raise CustomError("you can't have both the filename and the expnos be longer than 1")
+        filenames = [dirformat(args[0][0]) + '%d'%x for x in args[1]]
+    else:
+        filenames = args[0]
+    return filenames
+
+def load_file(*args,**kwargs):
+    'load a file or series of files; load as load_file(filename) or load_file(dirname,expnos)'
+    args = list(args)
+    #{{{ manually do kwargs
+    dimname = '' 
+    if 'dimname' in kwargs.keys(): dimname = kwargs['dimname']
+    calibration = 1.0
+    if 'calibration' in kwargs.keys(): calibration = kwargs['calibration']
+    add_sizes = []
+    if 'add_sizes' in kwargs.keys(): add_sizes = kwargs['add_sizes']
+    add_dims = []
+    if 'add_dims' in kwargs.keys(): add_dims = kwargs['add_dims']
+    #}}}
+    filenames = format_listofexps(args)
+    #{{{load all the data into a list
+    data = [load_indiv_file(filenames[0],dimname=dimname,add_sizes = add_sizes,add_dims = add_dims)]
+    for filename in filenames[1:]:
+        data += [load_indiv_file(filename,dimname=dimname,add_sizes = add_sizes,add_dims = add_dims)]
+    #}}}
+    # for the following, I used to have a condition, but this is incompatible with the pop statement at the end
+    newdata = concat(data,dimname) # allocate the size of the indirect array
+    #print 'DEBUG concatenated list = ',data
+    newdata_shape = ndshape(newdata)
+    if all(map((lambda x:det_type(x)[0]=='prospa'),filenames)):
+        if hasattr(data[0],'want_to_prospa_decim_correct'):
+            if data[0].want_to_prospa_decim_correct is True:
+                newdata = prospa_decim_correct(newdata)
+    #print 'DEBUG concatenated list before pop = ',data
+    if newdata_shape[dimname]==1:
+        newdata.popdim(dimname)
+    return newdata*calibration
+
+def load_indiv_file(filename,dimname='',return_acq=False,add_sizes=[],add_dims=[]):
+    filetype,twod = det_type(filename)
+    #{{{ ESR spectra
+    if filetype == 'winepr':
+        fp = open(filename+'.spc','rb')
+        data = fp.read()
+        data = array(
+                struct.unpack('<%df'%(len(data)/4),data),
+                dtype='double')
+        v = winepr_load_acqu(filename)
+        xpoints = v['RES']
+        rg = v['RRG']
+        data /= rg
+        modulation = v['RMA']
+        #data /= modulation
+        try:
+            data /= v['JNS'] # divide by number of scans
+        except:
+            pass
+        #data /= v['MP'] # divide by power <-- weird, don't do this!
+        ypoints = len(data)/xpoints
+        if ypoints>1:
+            if ypoints != v['REY']:
+                raise CustomError('I thought REY was the indirect dim, guess not')
+            if dimname=='':
+                dimname = v['JEY']
+            data = nddata(data,[ypoints,xpoints],[dimname,b0])
+        else:
+            data = nddata(data,[xpoints],[b0])
+        xlabels = linspace(v['HCF']-v['HSW']/2.,v['HCF']+v['HSW']/2.,xpoints)
+        if len(data.dimlabels)>1:
+            yaxis = r_[0:v['REY']]
+            if dimname == 'mw-power-sweep':
+                yaxis *= v['MPS']
+                yaxis += v['XYLB'] # the starting attenuation
+                yaxis = 10**(-yaxis/10.) # convert to linear power
+                yaxis *= v['MP']/yaxis[0] # the initial power
+                yaxis *= 1e-3 # convert from mW to W
+                data.rename('mw-power-sweep','power')
+                dimname = 'power'
+            data.labels([dimname,b0],[yaxis,xlabels])
+            data.reorder([b0,dimname])
+        else:
+            data.labels([b0],[xlabels])
+        return data
+    #}}}
+    filename = dirformat(filename)
+    #{{{ Bruker 2D
+    if twod and filetype == 'bruker':
+        v = bruker_load_acqu(filename)
+        v2 = bruker_load_acqu(filename,whichdim='2')
+        td2 = int(v['TD'])
+        rg = float(v['RG'])
+        td1 = int(v2['TD'])
+        td2_zf = int(ceil(td2/256.)*256) # round up to 256 points, which is how it's stored
+        fp = open(filename+'ser','rb')
+        data = fp.read()
+        if float(v.get('BYTORDA')) == float(1.0):
+            ### Read for big endian
+            data = array(struct.unpack('>%di'%(len(data)/4),data),
+                    dtype='complex128')
+        if float(v.get('BYTORDA')) == float(0.0):
+            ### Read for little endian
+            data = array(struct.unpack('<%di'%(len(data)/4),data),
+                    dtype='complex128')
+        data = data[0::2]+1j*data[1::2]
+        data /= rg
+        mydimsizes = [td1,td2_zf/2]
+        mydimnames = [dimname]+['t2']
+        #print 'DEBUG: data going to nddata =',data
+        try:
+            data = nddata(data,mydimsizes,mydimnames)
+        except:
+            size_it_should_be = array(mydimsizes).prod()
+            if size_it_should_be > len(data):
+                zero_filled_data = zeros(size_it_should_be)
+                zero_filled_data[0:len(data)] = data
+                data = nddata(zero_filled_data,mydimsizes,mydimnames)
+            else:
+                new_guess = len(data)/(td2_zf/2)
+                print lsafen("WARNING!, chopping the length of the data to fit the specified td1 of ",td1,"points!\n(specified ",zip(mydimnames,mydimsizes),' td2_zf=%d)'%td2_zf)
+                #td2_zf_new = 2**ceil(log(td2)/log(2))
+                #mydimsizes[1] = td2_zf_new
+                #size_it_might_be = array(mydimsizes).prod()
+                #print "maybe this works:",size_it_might_be == len(data)
+                data = data[0:size_it_should_be]
+                data = nddata(data,mydimsizes,mydimnames)
+                #raise CustomError("found td1=",td1,"for",filename,"which I don't think is right, because the product of the dimensions",zip(mydimnames,mydimsizes),'=',size_it_should_be,'does not equal the length of the data',len(data),'I think that it should be',len(data)/(td2_zf/2))
+        #print 'DEBUG: data straight from nddata =',data
+        data = data['t2',0:td2/2] # now, chop out their zero filling
+        t2axis = 1./v['SW_h']*r_[1:td2/2+1]
+        t1axis = r_[0:td1]
+        mylabels = [t1axis]+[t2axis]
+        data.labels(mydimnames,mylabels)
+        shiftpoints = int(bruker_det_phcorr(v)) # use the canned routine to calculate the first order phase shift
+        data.circshift('t2',shiftpoints)
+        data.set_units('t2','s')
+        data.set_units('digital')
+        data.other_info['title'] = bruker_load_title(filename)
+        #print 'DEBUG 2: data from bruker file =',data
+        #}}}
+        #{{{ Prospa 2D
+    elif twod and filetype == 'prospa':
+        if twod == 't1_sub':
+            v = prospa_load_acqu(filename+'../') # if it's subdirectory format, the file comes from one directory up
+            indirect_dim_len = [1]
+            indirect_dim_name = [dimname]
+            dimshere = 1
+        else:
+            v = prospa_load_acqu(filename)
+            indirect_dim_name = []
+            indirect_dim_len = []
+            dimshere = 2
+        taxis = linspace(0,1,v['nrPnts'])*v['acqTime']/1e3 # this is the t2 dimension, and so is always true
+        data = prospa_load_datafile(filename,dims=dimshere)/v['nrScans']#added this 2/20/13 to allow automatic signal averaging
+        #{{{ Prospa CPMG
+        if v['experiment'].find('cpmg') > -1:
+            data = nddata(data,indirect_dim_len+[v['nrEchoes'],v['nrPnts']],indirect_dim_name+['echo','t2'])
+            echotime = (r_[0:v['nrEchoes']]+0.5)*v['echoTime']/1e6
+            data.labels(indirect_dim_name+['echo','t2'],indirect_dim_len+[echotime,taxis])
+            data.want_to_prospa_decim_correct = False
+        #}}}
+        #{{{ Prospa where 1D subscan is not CPMG
+        else:
+            data = nddata(data,indirect_dim_len+[v['nrPnts']],indirect_dim_name+['t2'])
+            data.labels([dimname,'t2'],[r_[1],taxis])
+            data.want_to_prospa_decim_correct = True
+        #}}}
+        #}}}
+        #{{{ bruker 1D
+    else:
+        if filetype == 'bruker':
+            v = bruker_load_acqu(filename)
+            td2 = int(v['TD'])
+            td1 = 1
+            td2_zf = int(ceil(td2/256.)*256) # round up to 256 points, which is how it's stored
+            fp = open(filename+'fid','rb')
+            data = fp.read()
+            data = array(
+                    struct.unpack('>%di'%(len(data)/4),data),
+                    dtype='complex128')
+            data = data[0::2]+1j*data[1::2]
+            rg = v['RG']
+            data /= rg
+            data = nddata(data,[td1,td2_zf/2],[dimname,'t2'])
+            data = data['t2',0:td2/2] # now, chop out their zero filling
+            t2axis = 1./v['SW_h']*r_[1:td2/2+1]
+            t1axis = r_[1]
+            data.labels([dimname,'t2'],[t1axis,t2axis])
+            shiftpoints = int(bruker_det_phcorr(v)) # use the canned routine to calculate the second order phase shift
+            #print 'shiftpoints = ',shiftpoints
+            data.circshift('t2',shiftpoints)
+            # finally, I will probably need to add in the first order phase shift for the decimation --> just translate this
+            data.other_info['title'] = bruker_load_title(filename)
+        #}}}
+        #{{{ prospa 1d
+        elif filetype == 'prospa':
+            v = prospa_load_acqu(filename)
+            data = prospa_load_datafile(filename,dims=1)/v['nrScans']#added this 2/20/13 to allow automatic signal averaging
+            data = nddata(data,[v['nrPnts']],['t2'])
+            taxis = linspace(0,1,v['nrPnts'])*v['acqTime']/1e3
+            data.labels(['t2'],[taxis])
+        #}}}
+        else:
+            raise CustomError("can't load this file type $\\rightarrow$ \\verb+%s+"%filename)
+
+    #{{{ return, and if necessary, reorganize
+    if len(add_sizes)>0:
+        data.labels([dimname],[[]]) # remove the axis, so we can reshape
+        #print 'DEBUG: data before chunk = ',data
+        data.chunkoff(dimname,add_dims,add_sizes)
+        #print 'DEBUG: data after chunk = ',data
+        data.labels(add_dims,
+                [r_[0:x] for x in add_sizes])
+    if return_acq:
+        return (data,v,v2)
+    else:
+        return data
+    #}}}
+
+#{{{ t1 axis
+def load_t1_axis(file):
+    if det_type(file)[0] == 'bruker':
+        return bruker_load_t1_axis(file)
+    elif det_type(file)[0] == 'prospa':
+        return prospa_t1_info(file)[1]
+    else:
+        raise CustomError('Trying to load T1 axis on a file of unrecognized format!')
+#}}}
+
+#{{{ load acqu
+def prospa_decim_correct(data):
+    #{{{ get rid of the finite rise time    
+    data_abs = abs(data)
+    otherdims = ndshape(data)
+    otherdims.pop('t2')
+    for indirect_dim_name in otherdims.dimlabels:
+        data_abs.mean(indirect_dim_name)
+    data_abs = data_abs.run(argmax,'t2')
+    top = int(data_abs.data)
+    data.circshift('t2',top)
+    #}}}
+    print 'Applied prospa decimation correction'
+    return data
+
+def prospa_load_acqu(file):
+    file = dirformat(file)
+    fp = open(file+'acqu.par')
+    lines = fp.readlines()
+    line_re = re.compile(r'([^ \t]+) *= *(.+)')
+    vars = {}
+    for j in range(0,len(lines)):
+        lines[j] = string.rstrip(lines[j])
+        m = line_re.match(lines[j])
+        if m:
+            exec 'temp = %s'%m.groups()[1]
+            vars.update({m.groups()[0]:temp})
+        else:
+            print "error, acqu.par line not parsed: ",lines[j]
+    fp.close()
+    return vars
+#}}}
+
+#{{{ load_datafile
+def prospa_load_datafile(file,dims=1):
+    r'''load a prospa datafile into a flat array as a 1D file
+    use dims=2 if it's a 2D file'''
+    file = dirformat(file)
+    if dims == 1:
+        fp = open(file+'data.1d','rb')
+    elif dims == 2:
+        fp = open(file+'data.2d','rb')
+    else:
+        print 'ERROR: wrong number of dims'
+    data = fp.read()
+    data = array(struct.unpack('%df'%(len(data)/4),data))
+    data = data[7:]
+    # the following is junk!!!
+    #elif precision=='b':
+    #   data = array(struct.unpack('%db'%(len(data)/1),data))
+    #   data = data[7*4:]
+    #else:
+    #   print 'error, precision wrong'
+    data = reshape(data,(-1,2))
+    data = data[:,0]+1j*data[:,1]
+    fp.close()
+    return data
+#}}}
+
+#{{{ load the data from a t1 file based on file names
+def prospa_t1_info(file):
+    file = dirformat(file)
+    if det_type(file) == ('prospa','t1_sub'):
+        file += '../'
+    elif not det_type(file) == ('prospa','t1'):
+        raise CustomError("You're trying to get prospa T1 info from a file that's not a Prospa T1 file!")
+    files = [x for x in os.listdir(file) if os.path.isdir(dirformat(file)+x)]
+    file_re = re.compile(r'([0-9]+)msDelay$')
+    datafiles = []
+    wait_time = []
+    print 'DEBUG: prospa is searching for times in the file list',files
+    for j in range(0,len(files)):
+        m = file_re.match(files[j])
+        if m:
+            datafiles += [file+files[j]]
+            wait_time += [int(m.groups()[0])]
+    return datafiles,array(wait_time)*1e-3
+#}}}
+
+#{{{ Load T1 axis
+def bruker_load_t1_axis(files):
+    wait_time = []
+    if type(files) is str:
+        files = [files]
+    #print 'DEBUG: trying to load files: ',files
+    for thisfile in files:
+        thisfile = dirformat(thisfile)
+        thisfiletype = det_type(thisfile)
+        if thisfiletype[0] == 'prospa':
+            print 'need to copy over code from prospa'
+        if thisfiletype[0] == 'bruker':
+            wait_time += [bruker_load_vdlist(thisfile)]
+        else:
+            print 'couldn\'t determine thisfile type'
+    return array(wait_time).flatten()
+#}}}
+
+### Bruker Specific
+#{{{ calculate decimation correction
+def bruker_det_phcorr(v):
+    if v['DIGMOD']==1:
+        gdparray=array([[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],[179,201,533,709,1097,1449,2225,2929,4481,5889,8993,11809,18017,23649,36065,47329,72161,94689,144353,189409,288737],[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],[184,219,384,602,852,1668,2292,3368,4616,6768,9264,13568,18560,27392,36992,55040,73856,110336,147584,220928,295040]])
+        decimarray=array([2,3,4,6,8,12,16,24,32,48,64,96,128,192,256,384,512,768,1024]) # the -1 is because this is an index, and copied from matlab code!!!
+        dspfvs = int(v['DSPFVS'])
+        decim = v['DECIM']
+        try:
+            retval = gdparray[dspfvs,where(decimarray==decim)[0]]/2/decim
+        except:
+            print r'\begin{tiny}'
+            print r'\begin{verbatim}'
+            print CustomError('Problem returning',dspfvs,where(decimarray==decim)[0],'from gdparray of size',shape(gdparray),'because decimarray is of size',shape(decimarray))
+            print r'\end{verbatim}'
+            print r'\end{tiny}'
+            retval = 0
+        return retval
+    else:
+        return array([0])
+#}}}
+
+
+def bruker_match_line(line,number_re,string_re,array_re):
+    m = number_re.match(line)
+    if m:
+        retval = (0,m.groups()[0],double(m.groups()[1]))
+    else:
+        m = string_re.match(line)
+        if m:
+            retstring = m.groups()[1]
+            if retstring[-1]=='>':
+                retstring = retstring[:-1]
+            retval = (1,m.groups()[0],0,retstring)
+        else:
+            m = array_re.match(line)
+            if m:
+                retval = (2,m.groups()[0],(double(m.groups()[1]),double(m.groups()[2])),m.groups()[3])
+            else:
+                retval = (3,line)
+    return retval
+
+#{{{ bruker_load_vdlist
+def bruker_load_vdlist(file):
+    fp = open(file+'vdlist')
+    lines = fp.readlines()
+    lines = map(string.rstrip,lines)
+    lines = map((lambda x: x.replace('m','e-3')),lines)
+    lines = map((lambda x: x.replace('s','')),lines)
+    lines = map((lambda x: x.replace('u','e-6')),lines)
+    lines = map(double,lines)
+    return array(lines)
+#}}}
+
+def load_title(file):
+    if det_type(file)[0] == 'bruker':
+        return bruker_load_title(file)
+    else:
+        return ''
+
+def bruker_load_title(file):
+    file = dirformat(file)
+    fp = open(file+'pdata/1/title')
+    lines = fp.readlines()
+    emptystring = '\r\n'
+    while emptystring in lines:
+        lines.pop(lines.index(emptystring))
+    emptystring = '\n'
+    while emptystring in lines:
+        lines.pop(lines.index(emptystring))
+    return ''.join(lines)
+
+def bruker_load_acqu(file,whichdim='',return_s = True):
+    if return_s:
+        fp = open(file+'acqu'+whichdim+'s')# this is what I am initially doing, and what works with the matched filtering, etc, as is, but it's actually wrong
+    else:
+        fp = open(file+'acqu'+whichdim)# this is actually right, but doesn't work with the matched filtering, etc.
+    lines = fp.readlines()
+    vars = {}
+    number_re = re.compile(r'##\$([_A-Za-z0-9]+) *= *([0-9\-\.]+)')
+    string_re = re.compile(r'##\$([_A-Za-z0-9]+) *= *<(.*)')
+    array_re = re.compile(r'##\$([_A-Za-z0-9]+) *= *\(([0-9]+)\.\.([0-9]+)\)(.*)')
+    lines = map(string.rstrip,lines)
+    j=0
+    retval =  bruker_match_line(lines[j],number_re,string_re,array_re)
+    j = j+1
+    retval2 =  bruker_match_line(lines[j],number_re,string_re,array_re) #always grab the second line
+    while j < len(lines):
+        isdata = False
+        if retval[0]==1 or retval[0]==2:
+            name = retval[1]
+            thislen = retval[2]
+            data = retval[3]
+            while (retval2[0] == 3) and (j<len(lines)): # eat up the following lines
+                data += ' '+retval2[1]
+                j = j+1
+                retval2 =  bruker_match_line(lines[j],number_re,string_re,array_re)
+            isdata = True
+        elif retval[0]==0:
+            name = retval[1]
+            data = retval[2]
+            isdata = True
+        #else:
+        #   print 'not a data line:',retval[1]
+        if(isdata):
+            if retval[0]==2: #if it's an array
+                data = data.split(' ')
+                if len(data)>0:
+                    while '' in data:
+                        data.remove('')
+                    try:
+                        data = map(double,data)
+                    except:
+                        print "can't map ",data," to float."
+                    if len(data)-1!= thislen[1]:
+                        print 'error:',len(data)-1,'!=',thislen[1]
+            vars.update({name:data})
+        # at this point, the string or array data is loaded into data and we have something in retval2 which is definitely a new line
+        retval = retval2
+        j = j+1
+        if j<len(lines):
+            retval2 =  bruker_match_line(lines[j],number_re,string_re,array_re)
+    fp.close()
+    return vars
 
